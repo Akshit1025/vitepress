@@ -1,18 +1,17 @@
-import { customAlphabet } from 'nanoid'
-import c from 'picocolors'
-import type { HtmlRendererOptions, IThemeRegistration } from 'shiki'
 import {
-  addClass,
-  createDiffProcessor,
-  createFocusProcessor,
-  createHighlightProcessor,
-  createRangeProcessor,
-  defineProcessor,
-  getHighlighter,
-  type Processor
-} from 'shiki-processor'
+  transformerCompactLineOptions,
+  transformerNotationDiff,
+  transformerNotationErrorLevel,
+  transformerNotationFocus,
+  transformerNotationHighlight,
+  type TransformerCompactLineOption
+} from '@shikijs/transformers'
+import { customAlphabet } from 'nanoid'
+import type { LanguageRegistration, ShikiTransformer } from 'shiki'
+import { createHighlighter, isSpecialLang } from 'shiki'
 import type { Logger } from 'vite'
-import type { ThemeOptions } from '../markdown'
+import type { MarkdownOptions, ThemeOptions } from '../markdown'
+import c from 'picocolors'
 
 const nanoid = customAlphabet('abcdefghijklmnopqrstuvwxyz', 10)
 
@@ -24,7 +23,7 @@ const nanoid = customAlphabet('abcdefghijklmnopqrstuvwxyz', 10)
  * 2. convert line numbers into line options:
  *    [{ line: number, classes: string[] }]
  */
-const attrsToLines = (attrs: string): HtmlRendererOptions['lineOptions'] => {
+function attrsToLines(attrs: string): TransformerCompactLineOption[] {
   attrs = attrs.replace(/^(?:\[.*?\])?.*?([\d,-]+).*/, '$1').trim()
   const result: number[] = []
   if (!attrs) {
@@ -48,109 +47,164 @@ const attrsToLines = (attrs: string): HtmlRendererOptions['lineOptions'] => {
   }))
 }
 
-const errorLevelProcessor = defineProcessor({
-  name: 'error-level',
-  handler: createRangeProcessor({
-    error: ['highlighted', 'error'],
-    warning: ['highlighted', 'warning']
-  })
-})
-
 export async function highlight(
-  theme: ThemeOptions = 'material-theme-palenight',
-  defaultLang: string = '',
+  theme: ThemeOptions,
+  options: MarkdownOptions,
   logger: Pick<Logger, 'warn'> = console
-): Promise<(str: string, lang: string, attrs: string) => string> {
-  const hasSingleTheme = typeof theme === 'string' || 'name' in theme
-  const getThemeName = (themeValue: IThemeRegistration) =>
-    typeof themeValue === 'string' ? themeValue : themeValue.name
+): Promise<
+  [(str: string, lang: string, attrs: string) => Promise<string>, () => void]
+> {
+  const {
+    defaultHighlightLang: defaultLang = 'txt',
+    codeTransformers: userTransformers = []
+  } = options
 
-  const processors: Processor[] = [
-    createFocusProcessor(),
-    createHighlightProcessor({ hasHighlightClass: 'highlighted' }),
-    createDiffProcessor(),
-    errorLevelProcessor
+  const highlighter = await createHighlighter({
+    themes:
+      typeof theme === 'object' && 'light' in theme && 'dark' in theme
+        ? [theme.light, theme.dark]
+        : [theme],
+    langs: [
+      ...(options.languages || []),
+      ...Object.values(options.languageAlias || {})
+    ],
+    langAlias: options.languageAlias
+  })
+
+  async function loadLanguage(name: string | LanguageRegistration) {
+    const lang = typeof name === 'string' ? name : name.name
+    if (
+      !isSpecialLang(lang) &&
+      !highlighter.getLoadedLanguages().includes(lang)
+    ) {
+      await highlighter.loadLanguage(lang as any)
+    }
+  }
+
+  await options?.shikiSetup?.(highlighter)
+
+  // TODO: remove explicit matchAlgorithm in shiki v3
+  const transformers: ShikiTransformer[] = [
+    transformerNotationDiff({
+      matchAlgorithm: 'v3'
+    }),
+    transformerNotationFocus({
+      matchAlgorithm: 'v3',
+      classActiveLine: 'has-focus',
+      classActivePre: 'has-focused-lines'
+    }),
+    transformerNotationHighlight({
+      matchAlgorithm: 'v3'
+    }),
+    transformerNotationErrorLevel({
+      matchAlgorithm: 'v3'
+    }),
+    {
+      name: 'vitepress:add-class',
+      pre(node) {
+        this.addClassToHast(node, 'vp-code')
+      }
+    },
+    {
+      name: 'vitepress:clean-up',
+      pre(node) {
+        delete node.properties.style
+      }
+    }
   ]
 
-  const highlighter = await getHighlighter({
-    themes: hasSingleTheme ? [theme] : [theme.dark, theme.light],
-    processors
-  })
-
-  const styleRE = /<pre[^>]*(style=".*?")/
-  const preRE = /^<pre(.*?)>/
-  const vueRE = /-vue$/
-  const lineNoRE = /:(no-)?line-numbers$/
+  const vueRE = /-vue(?=:|$)/
+  const lineNoStartRE = /=(\d*)/
+  const lineNoRE = /:(no-)?line-numbers(=\d*)?$/
   const mustacheRE = /\{\{.*?\}\}/g
 
-  return (str: string, lang: string, attrs: string) => {
-    const vPre = vueRE.test(lang) ? '' : 'v-pre'
-    lang =
-      lang.replace(lineNoRE, '').replace(vueRE, '').toLowerCase() || defaultLang
+  return [
+    async (str: string, lang: string, attrs: string) => {
+      const vPre = vueRE.test(lang) ? '' : 'v-pre'
+      lang =
+        lang
+          .replace(lineNoStartRE, '')
+          .replace(lineNoRE, '')
+          .replace(vueRE, '')
+          .toLowerCase() || defaultLang
 
-    if (lang) {
-      const langLoaded = highlighter.getLoadedLanguages().includes(lang as any)
-      if (!langLoaded && lang !== 'ansi') {
+      try {
+        await loadLanguage(lang)
+      } catch {
         logger.warn(
           c.yellow(
-            `\nThe language '${lang}' is not loaded, falling back to '${
-              defaultLang || 'txt'
-            }' for syntax highlighting.`
+            `\nThe language '${lang}' is not loaded, falling back to '${defaultLang}' for syntax highlighting.`
           )
         )
         lang = defaultLang
       }
-    }
 
-    const lineOptions = attrsToLines(attrs)
-    const cleanup = (str: string) =>
-      str
-        .replace(preRE, (_, attributes) => `<pre ${vPre}${attributes}>`)
-        .replace(styleRE, (_, style) => _.replace(style, ''))
+      const lineOptions = attrsToLines(attrs)
+      const mustaches = new Map<string, string>()
 
-    const mustaches = new Map<string, string>()
+      const removeMustache = (s: string) => {
+        if (vPre) return s
+        return s.replace(mustacheRE, (match) => {
+          let marker = mustaches.get(match)
+          if (!marker) {
+            marker = nanoid()
+            mustaches.set(match, marker)
+          }
+          return marker
+        })
+      }
 
-    const removeMustache = (s: string) => {
-      if (vPre) return s
-      return s.replace(mustacheRE, (match) => {
-        let marker = mustaches.get(match)
-        if (!marker) {
-          marker = nanoid()
-          mustaches.set(match, marker)
-        }
-        return marker
-      })
-    }
+      const restoreMustache = (s: string) => {
+        mustaches.forEach((marker, match) => {
+          s = s.replaceAll(marker, match)
+        })
+        return s
+      }
 
-    const restoreMustache = (s: string) => {
-      mustaches.forEach((marker, match) => {
-        s = s.replaceAll(marker, match)
-      })
-      return s
-    }
+      str = removeMustache(str).trimEnd()
 
-    str = removeMustache(str)
-
-    const codeToHtml = (theme: IThemeRegistration) => {
-      return cleanup(
-        restoreMustache(
-          lang === 'ansi'
-            ? highlighter.ansiToHtml(str, {
-                lineOptions,
-                theme: getThemeName(theme)
+      const highlighted = highlighter.codeToHtml(str, {
+        lang,
+        transformers: [
+          ...transformers,
+          transformerCompactLineOptions(lineOptions),
+          {
+            name: 'vitepress:v-pre',
+            pre(node) {
+              if (vPre) node.properties['v-pre'] = ''
+            }
+          },
+          {
+            name: 'vitepress:empty-line',
+            code(hast) {
+              hast.children.forEach((span) => {
+                if (
+                  span.type === 'element' &&
+                  span.tagName === 'span' &&
+                  Array.isArray(span.properties.class) &&
+                  span.properties.class.includes('line') &&
+                  span.children.length === 0
+                ) {
+                  span.children.push({
+                    type: 'element',
+                    tagName: 'wbr',
+                    properties: {},
+                    children: []
+                  })
+                }
               })
-            : highlighter.codeToHtml(str, {
-                lang,
-                lineOptions,
-                theme: getThemeName(theme)
-              })
-        )
-      )
-    }
+            }
+          },
+          ...userTransformers
+        ],
+        meta: { __raw: attrs },
+        ...(typeof theme === 'object' && 'light' in theme && 'dark' in theme
+          ? { themes: theme, defaultColor: false }
+          : { theme })
+      })
 
-    if (hasSingleTheme) return codeToHtml(theme)
-    const dark = addClass(codeToHtml(theme.dark), 'vp-code-dark', 'pre')
-    const light = addClass(codeToHtml(theme.light), 'vp-code-light', 'pre')
-    return dark + light
-  }
+      return restoreMustache(highlighted)
+    },
+    highlighter.dispose
+  ]
 }
